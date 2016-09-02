@@ -259,15 +259,6 @@ void removeImage(ImageLoader* image)
 		(*it)(image->machHeader(), image->getSlide());
 	}
 	
-	// tell all interested images
-	for (std::vector<ImageLoader*>::iterator it=sImagesToNotifyAboutOtherImages.begin(); it != sImagesToNotifyAboutOtherImages.end(); it++) {
-		dyld_image_info info;
-		info.imageLoadAddress = image->machHeader();
-		info.imageFilePath = image->getPath();
-		info.imageFileModDate = image->lastModified();
-		(*it)->doNotification(dyld_image_removing, 1, &info);
-	}
-
 	// remove from master list
 	for (std::vector<ImageLoader*>::iterator it=sAllImages.begin(); it != sAllImages.end(); it++) {
 		if ( *it == image ) {
@@ -512,9 +503,8 @@ void processDyldEnvironmentVarible(const char* key, const char* value)
 				sEnv.DYLD_ROOT_PATH = parseColonList(value);
 				for (int i=0; sEnv.DYLD_ROOT_PATH[i] != NULL; ++i) {
 					if ( sEnv.DYLD_ROOT_PATH[i][0] != '/' ) {
-						fprintf(stderr, "dyld: warning DYLD_ROOT_PATH not used because it contains a non-absolute path\n");
+						fprintf(stderr, "dyld: warning DYLD_ROOT_PATH not used because it contains a non-absolute path");
 						sEnv.DYLD_ROOT_PATH = NULL;
-						break;
 					}
 				}
 			}
@@ -663,7 +653,7 @@ static void checkEnvironmentVariables(const char* envp[])
 			if ( equals != NULL ) {
 				const char* value = &equals[1];
 				const int keyLen = equals-keyEqualsValue;
-				char key[keyLen+1];
+				char key[keyLen];
 				strncpy(key, keyEqualsValue, keyLen);
 				key[keyLen] = '\0';
 				processDyldEnvironmentVarible(key, value);
@@ -1870,16 +1860,20 @@ uintptr_t
 _main(const struct mach_header* mainExecutableMH, int argc, const char* argv[], const char* envp[], const char* apple[])
 {	
 	// Pickup the pointer to the exec path.
-	sExecPath = apple[0];
-	if ( sExecPath[0] != '/' ) {
+	const char* executable = apple[0];
+	if ( executable[0] == '/' ) {
+		// have full path, use it
+		sExecPath = executable;
+	}
+	else {
 		// have relative path, use cwd to make absolute
 		char cwdbuff[MAXPATHLEN];
 	    if ( getcwd(cwdbuff, MAXPATHLEN) != NULL ) {
 			// maybe use static buffer to avoid calling malloc so early...
-			char* s = new char[strlen(cwdbuff) + strlen(sExecPath) + 2];
+			char* s = new char[strlen(cwdbuff) + strlen(executable) + 2];
 			strcpy(s, cwdbuff);
 			strcat(s, "/");
-			strcat(s, sExecPath);
+			strcat(s, executable);
 			sExecPath = s;
 		}
 	}

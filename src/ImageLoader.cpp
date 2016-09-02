@@ -31,8 +31,6 @@
 #include <sys/types.h>
 #include <sys/stat.h> 
 #include <sys/mman.h>
-#include <sys/param.h>
-#include <sys/mount.h>
 
 #include "ImageLoader.h"
 
@@ -264,22 +262,21 @@ bool ImageLoader::decrementReferenceCount()
 	return ( --fReferenceCount == 0 );
 }
 
-// private method that handles circular dependencies by only search any image once
-const ImageLoader::Symbol* ImageLoader::findExportedSymbolInDependentImagesExcept(const char* name, std::set<const ImageLoader*>& dontSearchImages, ImageLoader** foundIn) const
+
+const ImageLoader::Symbol* ImageLoader::resolveSymbol(const char* name, bool searchSelf, ImageLoader** foundIn) const
 {
 	const ImageLoader::Symbol* sym;
 	// search self
-	if ( dontSearchImages.count(this) == 0 ) {
+	if ( searchSelf ) {
 		sym = this->findExportedSymbol(name, NULL, false, foundIn);
 		if ( sym != NULL )
 			return sym;
-		dontSearchImages.insert(this);
 	}
 
 	// search directly dependent libraries
 	for (uint32_t i=0; i < fLibrariesCount; ++i) {
 		ImageLoader* dependentImage = fLibraries[i].image;
-		if ( (dependentImage != NULL) && (dontSearchImages.count(dependentImage) == 0) ) {
+		if ( dependentImage != NULL ) {
 			const ImageLoader::Symbol* sym = dependentImage->findExportedSymbol(name, NULL, false, foundIn);
 			if ( sym != NULL )
 				return sym;
@@ -289,30 +286,16 @@ const ImageLoader::Symbol* ImageLoader::findExportedSymbolInDependentImagesExcep
 	// search indirectly dependent libraries
 	for (uint32_t i=0; i < fLibrariesCount; ++i) {
 		ImageLoader* dependentImage = fLibraries[i].image;
-		if ( (dependentImage != NULL) && (dontSearchImages.count(dependentImage) == 0) ) {
-			const ImageLoader::Symbol* sym = dependentImage->findExportedSymbolInDependentImagesExcept(name, dontSearchImages, foundIn);
+		if ( dependentImage != NULL ) {
+			const ImageLoader::Symbol* sym = dependentImage->resolveSymbol(name, false, foundIn);
 			if ( sym != NULL )
 				return sym;
-			dontSearchImages.insert(dependentImage);
 		}
 	}
 
 	return NULL;
 }
 
-
-const ImageLoader::Symbol* ImageLoader::findExportedSymbolInDependentImages(const char* name, ImageLoader** foundIn) const
-{
-	std::set<const ImageLoader*> dontSearchImages;
-	dontSearchImages.insert(this);	// don't search this image
-	return this->findExportedSymbolInDependentImagesExcept(name, dontSearchImages, foundIn);
-}
-
-const ImageLoader::Symbol* ImageLoader::findExportedSymbolInImageOrDependentImages(const char* name, ImageLoader** foundIn) const
-{
-	std::set<const ImageLoader*> dontSearchImages;
-	return this->findExportedSymbolInDependentImagesExcept(name, dontSearchImages, foundIn);
-}
 
 
 void ImageLoader::link(const LinkContext& context, BindingLaziness bindness, InitializerRunning inits, uint32_t notifyCount)
@@ -705,7 +688,7 @@ void ImageLoader::recursiveInitialization(const LinkContext& context)
 	}
 }
 
-void ImageLoader::reprebindCommit(const LinkContext& context, bool commit, bool unmapOld)
+void ImageLoader::reprebindCommit(const LinkContext& context, bool commit)
 {
 	// do nothing on unprebound images
 	if ( ! this->isPrebindable() )
@@ -721,7 +704,7 @@ void ImageLoader::reprebindCommit(const LinkContext& context, bool commit, bool 
 		throwf("realpath() failed on %s, errno=%d", this->getPath(), errno);
 	}
 	// recreate temp file name
-	char tempFilePath[strlen(realFilePath)+strlen("_redoprebinding")+2];
+	char tempFilePath[PATH_MAX];
 	ImageLoader::addSuffix(realFilePath, "_redoprebinding", tempFilePath);
 
 	if ( commit ) {
@@ -735,9 +718,6 @@ void ImageLoader::reprebindCommit(const LinkContext& context, bool commit, bool 
 			else
 				throwf("can't swap temporary re-prebound file: rename(%s,%s) returned errno=%d", tempFilePath, realFilePath, errno);
 		}
-		else if ( unmapOld ) {
-			this->prebindUnmap(context);
-		}
 	}
 	else {
 		// something went wrong during prebinding, delete the temp files
@@ -745,30 +725,25 @@ void ImageLoader::reprebindCommit(const LinkContext& context, bool commit, bool 
 	}
 }
 
-uint64_t ImageLoader::reprebind(const LinkContext& context, time_t timestamp)
+void ImageLoader::reprebind(const LinkContext& context, time_t timestamp)
 {
 	// do nothing on unprebound images
 	if ( ! this->isPrebindable() )
-		return INT64_MAX;
+		return;
 
 	// do nothing if prebinding is up to date
 	if ( this->usablePrebinding(context) ) {
 		if ( context.verbosePrebinding )
 			fprintf(stderr, "dyld: no need to re-prebind: %s\n", this->getPath());
-		return INT64_MAX;
+		return;
 	}
-	// recreate temp file name
-	char realFilePath[PATH_MAX];
-	if ( realpath(this->getPath(), realFilePath) == NULL ) {
-		throwf("realpath() failed on %s, errno=%d", this->getPath(), errno);
-	}
-	char tempFilePath[strlen(realFilePath)+strlen("_redoprebinding")+2];
-	ImageLoader::addSuffix(realFilePath, "_redoprebinding", tempFilePath);
-
 	// make copy of file and map it in
+	char tempFilePath[PATH_MAX];
+	realpath(this->getPath(), tempFilePath);
+	ImageLoader::addSuffix(this->getPath(), "_redoprebinding", tempFilePath);
 	uint8_t* fileToPrebind;
 	uint64_t fileToPrebindSize;
-	uint64_t freespace = this->copyAndMap(tempFilePath, &fileToPrebind, &fileToPrebindSize);
+	this->copyAndMap(tempFilePath, &fileToPrebind, &fileToPrebindSize);
 
 	// do format specific prebinding
 	this->doPrebinding(context, timestamp, fileToPrebind);
@@ -783,12 +758,10 @@ uint64_t ImageLoader::reprebind(const LinkContext& context, time_t timestamp)
 
 	// log
 	if ( context.verbosePrebinding )
-		fprintf(stderr, "dyld: re-prebound: %p %s\n", this->machHeader(), this->getPath());
-	
-	return freespace;
+		fprintf(stderr, "dyld: re-prebound: %s\n", this->getPath());
 }
 
-uint64_t ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, uint64_t* fileToPrebindSize) 
+void ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, uint64_t* fileToPrebindSize)
 {
 	// reopen dylib 
 	int src = open(this->getPath(), O_RDONLY);	
@@ -805,16 +778,16 @@ uint64_t ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, 
 	int dst = open(tempFile, O_CREAT | O_RDWR | O_TRUNC, stat_buf.st_mode);	
 	if ( dst == -1 )
 		throw "can't create temp image";
-
+	
 	// mark source as "don't cache"
 	(void)fcntl(src, F_NOCACHE, 1);
 	// we want to cache the dst because we are about to map it in and modify it
 	
 	// copy permission bits
 	if ( chmod(tempFile, stat_buf.st_mode & 07777) == -1 )
-		throwf("can't chmod temp image.  errno=%d for %s", errno, this->getPath());
+		throw "can't chmod temp image";
 	if ( chown(tempFile, stat_buf.st_uid, stat_buf.st_gid) == -1)
-		throwf("can't chown temp image.  errno=%d for %s", errno, this->getPath());
+		throw "can't chown temp image";
 		  
 	// copy contents
 	ssize_t len;
@@ -828,8 +801,7 @@ uint64_t ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, 
 			throw "can't allcoate copy buffer";
 	}
 	while ( (len = read(src, buffer, kBufferSize)) > 0 ) {
-		if ( write(dst, buffer, len) == -1 )
-			throwf("write failure copying dylib errno=%d for %s", errno, this->getPath());
+		write(dst, buffer, len);
 	}
 	
 	// map in dst file
@@ -838,12 +810,6 @@ uint64_t ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, 
 	if ( *fileToPrebind == (uint8_t*)(-1) )
 		throw "can't mmap temp image";
 		
-	// get free space remaining on dst volume
-	struct statfs statfs_buf;
-	if ( fstatfs(dst, &statfs_buf) != 0 )
-		throwf("can't fstatfs(), errno=%d for %s", errno, tempFile);
-	uint64_t freespace = statfs_buf.f_bavail * statfs_buf.f_bsize;
-	
 	// closing notes:  
 	//		ok to close file after mapped in
 	//		ok to throw above without closing file because the throw will terminate update_prebinding
@@ -851,8 +817,6 @@ uint64_t ImageLoader::copyAndMap(const char* tempFile, uint8_t** fileToPrebind, 
 	int result2 = close(src);
 	if ( (result1 != 0) || (result2 != 0) )
 		throw "can't close file";
-		
-	return freespace;
 }
 
 
